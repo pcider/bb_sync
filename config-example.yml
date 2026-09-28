@@ -1,0 +1,20 @@
+# Blackboard instance
+base_url: https://edimension.sutd.edu.sg
+landing_page: https://edimension.sutd.edu.sg/ultra/stream   # where the browser ends up after SSO
+
+# Output
+out_dir: downloads
+state_file: state.json
+
+# Behaviour
+courses: ""            # substring filter, empty = all courses
+download: true         # false = manifest only
+login_timeout: 600     # seconds to wait for Okta/SSO/MFA
+force_login: false     # true = skip saved session, always open browser
+
+# SSO autofill (port of github.com/pcider/auto-login-otp); leave empty to type manually
+login_host: ease.sutd.edu.sg   # only autofill on this host
+username: "101xyyy"
+password: ""
+totp_secret: "otpauth://totp/ease.sutd.edu.sg:<STUDENT_ID>?secret=<SECRET>"
+auto_submit: true      # click the submit button for you
