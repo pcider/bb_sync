@@ -1,6 +1,8 @@
 __pycache__/
 .claude/
+.DS_Store
 
 config.yml
 downloads/
 state.json
+logs/

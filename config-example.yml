@@ -11,6 +11,7 @@ courses: ""            # substring filter, empty = all courses
 download: true         # false = manifest only
 login_timeout: 600     # seconds to wait for Okta/SSO/MFA
 force_login: false     # true = skip saved session, always open browser
+desc_html_only: false  # true = save descriptions as .html only, no .txt
 
 # SSO autofill (port of github.com/pcider/auto-login-otp); leave empty to type manually
 login_host: ease.sutd.edu.sg   # only autofill on this host
@@ -18,3 +19,8 @@ username: "101xyyy"
 password: ""
 totp_secret: "otpauth://totp/ease.sutd.edu.sg:<STUDENT_ID>?secret=<SECRET>"
 auto_submit: true      # click the submit button for you
+
+# Logging
+log_level: INFO        # console (stderr): DEBUG, INFO, WARNING, ERROR
+log_dir: logs          # one DEBUG-level file per run: <log_dir>/DDMMYY_HHMMSS.log
+log_retention: 7d      # delete logs older than this (h/d/w, e.g. 12h, 7d, 2w); 0 = keep all

@@ -29,20 +29,28 @@ after the course (as BlackboardSync does):
 import argparse
 import base64
 import csv
+import filecmp
+import gzip
 import hashlib
 import hmac
 import html
 import json
+import logging
+import os
 import re
+import shutil
 import struct
 import sys
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 import yaml
 from playwright.sync_api import sync_playwright
+
+log = logging.getLogger("bb_sync")
 
 SESSION_COOKIES = {"BbRouter", "JSESSIONID"}
 API = "/learn/api/public/v1"
@@ -75,6 +83,7 @@ courses: ""            # substring filter, empty = all courses
 download: true         # false = manifest only
 login_timeout: 600     # seconds to wait for Okta/SSO/MFA
 force_login: false     # true = skip saved session, always open browser
+desc_html_only: false  # true = save descriptions as .html only, no .txt
 
 # SSO autofill (port of github.com/pcider/auto-login-otp); leave empty to type manually
 login_host: ease.sutd.edu.sg   # only autofill on this host
@@ -82,20 +91,28 @@ username: ""
 password: ""
 totp_secret: ""        # <SECRET> from otpauth://...?secret=<SECRET> (or the whole URL)
 auto_submit: true      # click the submit button for you
+
+# Logging
+log_level: INFO        # console (stderr): DEBUG, INFO, WARNING, ERROR
+log_dir: logs          # one DEBUG-level file per run: <log_dir>/DDMMYY_HHMMSS.log
+log_retention: 7d      # delete logs older than this (h/d/w, e.g. 12h, 7d, 2w); 0 = keep all
 """
+
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+DURATION_UNITS = {"h": 3600, "d": 86400, "w": 7 * 86400}
 
 
 def load_config(path: str) -> dict:
     p = Path(path)
     if not p.exists():
-        print(f"[!] Config file not found: {p}\n")
-        print("[!] Create one, e.g.:\n" + CONFIG_TEMPLATE)
+        print(f"[!] Config file not found: {p}\n", file=sys.stderr)
+        print("[!] Create one, e.g.:\n" + CONFIG_TEMPLATE, file=sys.stderr)
         sys.exit(1)
     cfg = yaml.safe_load(p.read_text()) or {}
 
     for req in ("base_url",):
         if req not in cfg:
-            print(f"[!] config.yml is missing required key '{req}'")
+            print(f"[!] config.yml is missing required key '{req}'", file=sys.stderr)
             sys.exit(1)
 
     cfg["base_url"] = str(cfg["base_url"]).rstrip("/")
@@ -112,11 +129,93 @@ def load_config(path: str) -> dict:
     cfg.setdefault("download", True)
     cfg.setdefault("login_timeout", 600)
     cfg.setdefault("force_login", False)
+    cfg.setdefault("desc_html_only", False)
     cfg.setdefault("login_host", "ease.sutd.edu.sg")
     for k in ("username", "password", "totp_secret"):
         cfg[k] = str(cfg.get(k) or "")
     cfg.setdefault("auto_submit", True)
+
+    cfg["log_level"] = str(cfg.get("log_level") or "INFO").upper()
+    if cfg["log_level"] not in LOG_LEVELS:
+        print(f"[!] log_level must be one of {', '.join(LOG_LEVELS)}", file=sys.stderr)
+        sys.exit(1)
+    cfg.setdefault("log_dir", "logs")
+    try:
+        cfg["log_retention"] = parse_duration(cfg.get("log_retention", "7d"))
+    except ValueError as e:
+        print(f"[!] log_retention: {e}", file=sys.stderr)
+        sys.exit(1)
     return cfg
+
+
+def parse_duration(value) -> int:
+    """'12h' / '7d' / '2w' -> seconds. 0, '' or None -> 0 (keep forever)."""
+    v = str(value or "0").strip().lower()
+    if v == "0":
+        return 0
+    m = re.fullmatch(r"(\d+)\s*([hdw])", v)
+    if not m:
+        raise ValueError(f"expected a number followed by h, d or w, got {value!r}")
+    return int(m.group(1)) * DURATION_UNITS[m.group(2)]
+
+
+# --------------------------------------------------------------- logging ---
+
+def setup_logging(cfg: dict) -> Path:
+    """Console handler on stderr at log_level; DEBUG file handler in log_dir."""
+    log_dir = Path(cfg["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / time.strftime("%d%m%y_%H%M%S.log")
+
+    log.setLevel(logging.DEBUG)
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(cfg["log_level"])
+    console.setFormatter(logging.Formatter("%(levelname)-7s %(message)s"))
+    file = logging.FileHandler(log_path, encoding="utf-8")
+    file.setLevel(logging.DEBUG)
+    file.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(funcName)s: %(message)s"))
+    log.addHandler(console)
+    log.addHandler(file)
+
+    # plain .log files other than ours are left over from runs that crashed
+    for p in log_dir.glob("*.log"):
+        if p != log_path:
+            gzip_log(p)
+    rotate_logs(log_dir, cfg["log_retention"])
+    log.debug("Log file: %s", log_path)
+    return log_path
+
+
+def gzip_log(path: Path) -> Path:
+    """path -> path.gz (keeping its mtime, which rotation relies on)."""
+    gz = path.with_name(path.name + ".gz")
+    st = path.stat()
+    with open(path, "rb") as src, gzip.open(gz, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    os.utime(gz, (st.st_atime, st.st_mtime))
+    path.unlink()
+    return gz
+
+
+def finish_logging(log_path: Path):
+    """Close the file handler and compress this run's log."""
+    for h in list(log.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            log.removeHandler(h)
+    gz = gzip_log(log_path)
+    log.info("Log saved to %s", gz)
+
+
+def rotate_logs(log_dir: Path, retention: int):
+    if not retention:
+        return
+    cutoff = time.time() - retention
+    for p in log_dir.glob("*.log.gz"):
+        if p.stat().st_mtime < cutoff:
+            p.unlink()
+            log.debug("Deleted old log %s", p)
 
 
 # ---------------------------------------------------------------- auth -----
@@ -161,7 +260,7 @@ class SSOAutofill:
         prev_step, prev_t = self.last
         if step == prev_step and time.time() - prev_t < 5:
             return
-        print(f"[*] Autofill: submitting {step}")
+        log.info("Autofill: submitting %s", step)
         btn.click()
         self.last = (step, time.time())
 
@@ -175,7 +274,7 @@ class SSOAutofill:
         totp_input = sel(TOTP_FIELD_SELECTOR)
 
         if sel(ERROR_ICON_SELECTOR):
-            print("[!] Autofill: login error detected, bailing out; finish manually.")
+            log.warning("Autofill: login error detected, bailing out; finish manually.")
             self.enabled = False
             return
         if not submit_btn:
@@ -211,8 +310,8 @@ def browser_login(cfg: dict, state_path: Path):
     base_url = cfg["base_url"]
     landing = cfg["landing_page"]
 
-    print(f"\n[*] Opening browser at {landing}")
-    print("[*] Complete your university login (Okta/MFA). Waiting...")
+    log.info("Opening browser at %s", landing)
+    log.info("Complete your university login (Okta/MFA). Waiting...")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
@@ -231,7 +330,7 @@ def browser_login(cfg: dict, state_path: Path):
                 # Blackboard's login chooser: pick "NetID" to go to EASE
                 if (urlparse(page.url).netloc == bb_host and page.url != chooser_done
                         and page.evaluate("typeof process === 'function'")):
-                    print("[*] Login chooser: calling process('netId')")
+                    log.info("Login chooser: calling process('netId')")
                     chooser_done = page.url
                     page.evaluate("process('netId')")
                 autofill.poll(page)
@@ -239,12 +338,12 @@ def browser_login(cfg: dict, state_path: Path):
                 cookie_names = {c["name"] for c in context.cookies(base_url)}
                 if on_landing and (SESSION_COOKIES & cookie_names):
                     context.storage_state(path=str(state_path))
-                    print(f"[*] Landed on {page.url}")
-                    print(f"[*] Login captured, session saved to {state_path}")
+                    log.info("Landed on %s", page.url)
+                    log.info("Login captured, session saved to %s", state_path)
                     browser.close()
                     return
-            except Exception:
-                pass  # page mid-navigation
+            except Exception as e:  # page mid-navigation
+                log.debug("Login poll: %s", e)
             page.wait_for_timeout(500)
 
         browser.close()
@@ -279,9 +378,12 @@ def check_session(s: requests.Session, base_url: str) -> bool:
 def api_get(s: requests.Session, url: str, params=None, retries: int = 4):
     for attempt in range(retries):
         r = s.get(url, params=params, timeout=30)
+        log.debug("GET %s %s -> %d", url, params or "", r.status_code)
         if r.status_code == 401:
             raise SessionExpired
         if r.status_code in (429, 503):
+            log.warning("HTTP %d from %s, retrying in %ds",
+                        r.status_code, url, 2 ** attempt)
             time.sleep(2 ** attempt)
             continue
         r.raise_for_status()
@@ -400,10 +502,11 @@ class NameClash:
 
 class Ctx:
     def __init__(self, s, base_url, course_id, course_name, claimer,
-                 rows, errors, download):
+                 rows, errors, download, desc_html_only=False):
         self.s, self.base_url, self.course_id = s, base_url, course_id
         self.course_name, self.claimer = course_name, claimer
         self.rows, self.errors, self.download = rows, errors, download
+        self.desc_html_only = desc_html_only
 
     def launch_url(self, content_id):
         return (f"{self.base_url}/webapps/blackboard/content/launchLink.jsp"
@@ -417,61 +520,158 @@ def prune_empty_dirs(root: Path) -> int:
                     key=lambda p: len(p.parts), reverse=True):
         if not any(d.iterdir()):
             d.rmdir()
+            log.info("Removed empty folder %s", d)
             removed += 1
     return removed
 
 
-def save_stream(s, url, dest: Path, errors):
+def archive_path(dest: Path) -> Path:
+    """<stem>_<DDMMYYYY_HHMMSS of dest's mtime><suffix>, numbered if taken."""
+    date = time.strftime("%d%m%Y_%H%M%S", time.localtime(dest.stat().st_mtime))
+    p = dest.with_name(f"{dest.stem}_{date}{dest.suffix}")
+    i = 2
+    while p.exists():
+        p = dest.with_name(f"{dest.stem}_{date}_{i}{dest.suffix}")
+        i += 1
+    return p
+
+
+def install(tmp: Path, dest: Path) -> str:
+    """Move tmp into dest. Never overwrites a different existing file: that one
+    is renamed via archive_path() first. Identical content is left alone."""
     if dest.exists() and dest.stat().st_size > 0:
-        return "skipped (exists)"
+        if filecmp.cmp(tmp, dest, shallow=False):
+            tmp.unlink()
+            return "unchanged"
+        old = archive_path(dest)
+        dest.rename(old)
+        tmp.replace(dest)
+        log.info("Updated %s (previous version kept as %s)", dest, old.name)
+        return f"updated (previous: {old.name})"
+    tmp.replace(dest)
+    return "ok"
+
+
+# Blackboard signs file links afresh on every API call by appending params like
+# Kq3cZcYS15=...&VxJw3wfC56=<expiry>&3cCnGYSz89=<sig>. The names are random
+# per installation but always 10 chars mixing upper, lower and digits, which
+# no ordinary Blackboard param (course_id, mode, ...) does. The value stops at
+# the next & (so also at &amp; / &quot;), quote, whitespace, tag end or \".
+SIGNING_PARAM_RE = re.compile(
+    r"""(?:[?&]|&amp;)(?=[A-Za-z0-9]{10}=)(?=[^=]*[A-Z])(?=[^=]*[a-z])"""
+    r"""(?=[^=]*[0-9])[A-Za-z0-9]{10}=[^&"'\s<>\\]*""")
+
+
+def unsigned(text: str) -> str:
+    return SIGNING_PARAM_RE.sub("", text)
+
+
+def write_versioned(dest: Path, text: str):
+    """Write a generated text file. Content that differs from the existing
+    file only in URL signatures counts as unchanged (the file is left alone)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        try:
+            if unsigned(dest.read_text(encoding="utf-8")) == unsigned(text):
+                return
+        except UnicodeDecodeError:
+            pass
+    tmp = dest.with_name(dest.name + ".part")
+    tmp.write_text(text, encoding="utf-8")
+    install(tmp, dest)
+
+
+def server_mtime(r) -> float | None:
     try:
+        return parsedate_to_datetime(r.headers["Last-Modified"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def looks_unchanged(r, dest: Path, mtime: float | None) -> bool:
+    """Compare the response headers against the local copy (whose mtime we set
+    to the server's Last-Modified when it was saved)."""
+    if mtime is None or not dest.exists() or dest.stat().st_size == 0:
+        return False
+    st = dest.stat()
+    size = r.headers.get("Content-Length")
+    if size is not None and "Content-Encoding" not in r.headers \
+            and int(size) != st.st_size:
+        return False
+    return int(st.st_mtime) == int(mtime)
+
+
+def save_stream(s, url, dest: Path, errors):
+    try:
+        # Headers arrive first; if they match the local copy, close the
+        # connection without downloading the body.
         with s.get(url, stream=True, allow_redirects=True, timeout=120) as r:
             if r.status_code == 401:
                 raise SessionExpired
+            if r.status_code == 404:
+                # Seen for files not released to students (item visible,
+                # file hidden) and for links into old/deleted courses.
+                errors.append(f"{dest}: not available on the server (404)")
+                log.warning("Not available on the server (404; unreleased "
+                            "or deleted): %s", dest)
+                log.debug("404 URL: %s -> %s", url, r.url)
+                return "error: 404"
             r.raise_for_status()
-            tmp = dest.with_suffix(dest.suffix + ".part")
+            mtime = server_mtime(r)
+            if looks_unchanged(r, dest, mtime):
+                log.debug("Unchanged, skipped: %s", dest)
+                return "unchanged"
+            log.debug("Fetching %s (Last-Modified=%s Content-Length=%s)",
+                      dest, r.headers.get("Last-Modified"),
+                      r.headers.get("Content-Length"))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".part")
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(1 << 16):
                     f.write(chunk)
-            tmp.replace(dest)
+        status = install(tmp, dest)
+        if mtime is not None:   # so the next run can skip it by headers alone
+            os.utime(dest, (mtime, mtime))
+        if status == "ok":
+            log.info("Downloaded %s", dest)
+        else:
+            log.debug("%s: %s", status, dest)
         time.sleep(0.3)
-        return "ok"
+        return status
     except SessionExpired:
         raise
     except Exception as e:  # noqa: BLE001
         errors.append(f"{url} -> {e}")
+        log.error("Download failed: %s -> %s: %s", url, dest, e)
         return f"error: {e}"
 
 
 # ------------------------------------------------------ disk emitters -----
 
 def make_dir(ctx, parent_dir, title, suffix=""):
-    d = parent_dir / ctx.claimer.claim(parent_dir, sanitize(title) + suffix)
-    if ctx.download:
-        d.mkdir(parents=True, exist_ok=True)
-    return d
+    # Created lazily by whatever writes into it, so empty items leave no folder
+    return parent_dir / ctx.claimer.claim(parent_dir, sanitize(title) + suffix)
 
 
 def write_desc(ctx, directory, title, body, entry):
     if not ctx.download or not (body or "").strip():
         return
     safe = sanitize(title)
-    p1 = directory / ctx.claimer.claim(directory, f"{safe}_desc.txt")
+    if not ctx.desc_html_only:
+        p1 = directory / ctx.claimer.claim(directory, f"{safe}_desc.txt")
+        write_versioned(p1, strip_html(body) + "\n")
+        entry["artifacts"].append(p1.name)
     p2 = directory / ctx.claimer.claim(directory, f"{safe}_desc.html")
-    p1.write_text(strip_html(body) + "\n", encoding="utf-8")
-    p2.write_text(f'<!doctype html><meta charset="utf-8">'
-                  f'<title>{html.escape(title)}</title>\n{body}\n',
-                  encoding="utf-8")
-    entry["artifacts"].extend([p1.name, p2.name])
+    write_versioned(p2, f'<!doctype html><meta charset="utf-8">'
+                        f'<title>{html.escape(title)}</title>\n{body}\n')
+    entry["artifacts"].append(p2.name)
 
 
 def dump_info(ctx, directory, title, node, entry):
     if not ctx.download:
         return
     p = directory / ctx.claimer.claim(directory, f"{sanitize(title)}_info.json")
-    p.write_text(json.dumps(node, indent=2, ensure_ascii=False) + "\n",
-                 encoding="utf-8")
+    write_versioned(p, json.dumps(node, indent=2, ensure_ascii=False) + "\n")
     entry["artifacts"].append(p.name)
 
 
@@ -489,25 +689,26 @@ def write_links_html(ctx, directory, heading, links):
             block += f'\n    <p class="desc">{desc}</p>'
         items.append(block + "</li>")
     page = ('<!doctype html>\n<html><head><meta charset="utf-8">'
-            f'<title>Links — {html.escape(heading)}</title>\n'
+            f'<title>Links - {html.escape(heading)}</title>\n'
             '<style>body{font-family:system-ui,sans-serif;max-width:48em;'
             'margin:2em auto;padding:0 1em}ul{padding-left:1.2em}'
             'small{color:#777}.desc{color:#444;margin:.15em 0 .8em}</style>\n'
             f'</head>\n<body>\n<h1>Links in {html.escape(heading)}</h1>\n<ul>\n'
             + "\n".join(items) + "\n</ul>\n</body></html>\n")
     p = directory / ctx.claimer.claim(directory, "links.html")
-    p.write_text(page, encoding="utf-8")
+    write_versioned(p, page)
 
 
 def write_course_desc(ctx, course_dir, cname, course, cnode):
     body = (course.get("description") or "").strip()
     if not ctx.download or not body:
         return
-    p1 = course_dir / ctx.claimer.claim(course_dir, f"{sanitize(cname)}_desc.txt")
+    if not ctx.desc_html_only:
+        p1 = course_dir / ctx.claimer.claim(course_dir, f"{sanitize(cname)}_desc.txt")
+        write_versioned(p1, body + "\n")
     p2 = course_dir / ctx.claimer.claim(course_dir, f"{sanitize(cname)}_desc.html")
-    p1.write_text(body + "\n", encoding="utf-8")
-    p2.write_text(f'<!doctype html><meta charset="utf-8">'
-                  f'<p>{html.escape(body)}</p>\n', encoding="utf-8")
+    write_versioned(p2, f'<!doctype html><meta charset="utf-8">'
+                        f'<p>{html.escape(body)}</p>\n')
     cnode["description"] = body
 
 
@@ -595,6 +796,8 @@ def process_node(ctx, node, parent_dir, breadcrumb):
     title = node.get("title") or "(untitled)"
     body = node.get("body") or ""
     cid = node.get("id")
+    log.debug("Item %s [%s/%s] %s", cid, cls, t or "?",
+              " / ".join(breadcrumb + [title]))
 
     entry = {
         "id": cid, "title": title, "type": t, "class": cls,
@@ -686,6 +889,20 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    log_path = setup_logging(cfg)
+    try:
+        return run(cfg)
+    except KeyboardInterrupt:
+        log.warning("Interrupted")
+        return 130
+    except Exception:
+        log.exception("Fatal error")
+        return 1
+    finally:
+        finish_logging(log_path)
+
+
+def run(cfg: dict):
     base_url = cfg["base_url"]
     state_path = Path(cfg["state_file"])
     out_dir = Path(cfg["out_dir"])
@@ -697,7 +914,7 @@ def main():
     if state_path.exists() and not cfg["force_login"]:
         s = session_from_state(state_path)
         if not check_session(s, base_url):
-            print("[*] Saved session expired, logging in again...")
+            log.info("Saved session expired, logging in again...")
             s = None
     if s is None:
         browser_login(cfg, state_path)
@@ -705,7 +922,7 @@ def main():
 
     me = get_me(s, base_url)
     user_id = me.get("id")
-    print(f"[*] Logged in as {me.get('userName', user_id)}")
+    log.info("Logged in as %s", me.get("userName", user_id))
 
     course_claimer = NameClash()
     manifest, rows, errors = [], [], []
@@ -714,16 +931,14 @@ def main():
         cname = course.get("name") or course.get("courseId") or course["id"]
         if cfg["courses"] and cfg["courses"].lower() not in cname.lower():
             continue
-        print(f"[*] Course: {cname}")
+        log.info("Course: %s", cname)
         # BlackboardSync-style: one folder per course, named after the course
         course_dir = out_dir / course_claimer.claim(out_dir, sanitize(cname))
-        if download:
-            course_dir.mkdir(parents=True, exist_ok=True)
 
         for attempt in (1, 2):   # one re-auth retry if session dies mid-course
             course_rows = []
             ctx = Ctx(s, base_url, course["id"], cname, NameClash(),
-                      course_rows, errors, download)
+                      course_rows, errors, download, cfg["desc_html_only"])
             cnode = {"course_id": course["id"], "course": cname, "children": []}
             write_course_desc(ctx, course_dir, cname, course, cnode)
             try:
@@ -731,20 +946,21 @@ def main():
                                 list_contents(s, base_url, course["id"]))
                 manifest.append(cnode)
                 rows.extend(course_rows)
-                print(f"    {len(course_rows)} items")
+                log.info("  %d items", len(course_rows))
                 break
             except SessionExpired:
                 if attempt == 1:
-                    print("[!] Session expired mid-run; re-authenticating...")
+                    log.warning("Session expired mid-run; re-authenticating...")
                     browser_login(cfg, state_path)
                     s = session_from_state(state_path)
                 else:
                     errors.append(f"course {cname}: session expired twice, skipped")
+                    log.error("Course %s: session expired twice, skipped", cname)
 
     if download:
         pruned = prune_empty_dirs(out_dir)
         if pruned:
-            print(f"[*] Removed {pruned} empty folders")
+            log.info("Removed %d empty folders", pruned)
 
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False))
@@ -754,11 +970,11 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print(f"\n[✓] Done: {len(rows)} items catalogued, {len(errors)} errors.")
-    print(f"[✓] Tree + descriptions: {out_dir / 'manifest.json'} / manifest.csv")
-    print(f"[✓] Files under: {out_dir}/")
+    log.info("Done: %d items catalogued, %d errors.", len(rows), len(errors))
+    log.info("Tree + descriptions: %s / manifest.csv", out_dir / "manifest.json")
+    log.info("Files under: %s/", out_dir)
     if errors:
-        print("[!] Errors:", *errors[:20], sep="\n    - ")
+        log.warning("Errors:\n    - %s", "\n    - ".join(errors[:20]))
 
 
 if __name__ == "__main__":
